@@ -1,6 +1,12 @@
 # melody-graph
 Create a video using melody graph of audio.
-    
+
+<a href="http://www.youtube.com/watch?feature=player_embedded&v=56Ja6zFgL-Y&t=2857
+" target="_blank"><img src="http://img.youtube.com/vi/56Ja6zFgL-Y/0.jpg" 
+alt="Example" width="480" height="360" border="0" /></a>
+
+<a href="http://www.youtube.com/watch?feature=player_embedded&v=56Ja6zFgL-Y&t=2857
+" target="_blank"> Sample Video [Youtube] </a>
 
 # Workflow with single sound
     music-grapher audio-file.m4a

@@ -1,0 +1,282 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import argparse
+import pickle
+
+args = None
+def main():
+    process_args()
+
+    power, melody = load_data()    
+    if args.action == 'sample':
+        # Create video out of 1/8 of the file
+        process(power[:len(power)/8], melody[:len(melody)/8])
+    else:
+        process(power, melody)
+
+def process_args():
+    global args
+
+    parser = argparse.ArgumentParser(description='', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('audio', type=str  ,  help='Input audio [required]')
+ 
+    parser.add_argument('--tonic', type=float, default=130.81  ,  help='Change the base frequency of C, for SA')   
+    parser.add_argument('--action', type=str, default='test'  ,  help='test, save, showall')
+    
+    parser.add_argument('--freq_min', type=int, default=200  ,  help='Min Freq Hz')
+    parser.add_argument('--freq_max', type=int, default=600  ,  help='Max Freq Hz')
+    parser.add_argument('--x_min', type=int, default=0  ,  help='usually 0, start of x range')
+    parser.add_argument('--x_max', type=int, default=1000  ,  help='length of data shown at a time/speed')
+    
+    parser.add_argument('--notation', type=str, default='in'  ,  help='Notation used, possible values are "en" CDEFGAB and "in" SARGAM ')
+    
+
+    parser.add_argument('--c_w', type=int, default=1920  ,  help='Video Width')
+    parser.add_argument('--c_h', type=int, default=1080  ,  help='Video Height')
+    parser.add_argument('--codec', type=str, default='libx264'  ,  help='Video Codec used')
+    
+    parser.add_argument('--interval', type=int, default=29  ,  help='gap per frame, fps=1000/interval; 29 used as it aligns with data')
+    parser.add_argument('--speed', type=int, default=10  ,  help='Magnification; 10x')
+    
+    parser.add_argument('--mel_voicing', type=float, default=0.00  ,  help='Melodia param; delete .melody file if changing')
+    parser.add_argument('--mel_minpeaksalience', type=float, default=0.00  ,  help='Melodia param; delete .melody file if changing')
+
+    parser.add_argument('--dpi', type=float, default=72.1  ,  help='dpi used')
+
+    # Design related
+    parser.add_argument('--dot_radius', type=float, default=6.0  ,  help='Radius of center dot')
+    parser.add_argument('--main_bg', type=str, default='#FFFFF0'  ,  help='Radius of center dot')
+    parser.add_argument('--melody_line_color', type=str, default='#2F4F4F'  ,  help='Radius of center dot')
+    parser.add_argument('--melody_dot_color', type=str, default='#8B0000'  ,  help='Radius of center dot')
+    parser.add_argument('--power_line_color', type=str, default='#000000'  ,  help='Radius of center dot')
+    parser.add_argument('--line_color', type=str, default='#000000'  ,  help='Radius of center dot')
+    parser.add_argument('--show_line', type=bool, default=True  ,  help='Radius of center dot')
+
+    args = parser.parse_args()
+
+
+
+def process(power,melody):
+    from matplotlib import pyplot as plt
+    from matplotlib import animation
+    from matplotlib.ticker import MultipleLocator, FormatStrFormatter
+    from matplotlib.lines import Line2D
+    
+    # plt.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.1)
+
+    fig = plt.figure(figsize=(args.c_w/args.dpi, args.c_h/args.dpi), dpi = args.dpi, facecolor='black' )
+    ax = plt.axes(aspect='equal', axisbg=args.main_bg)
+    ax.tick_params(axis='y', colors='white')
+    ax.spines['left'].set_color('white')
+    
+
+
+    # fig.add_axes((0,0,1920,1080), ax)
+    # ax.axis('off')
+    ax.autoscale(False)
+    ax.set_ylim(args.freq_min, args.freq_max)
+    ax.set_xlim(args.x_min , args.x_max)
+    
+    prepare_canvas(ax)
+
+    circle = plt.Circle((300,300), args.dot_radius, color=args.melody_dot_color)
+    # circle.set_clip_on(True)
+    ax.add_artist(circle)
+
+    melody_graph = Line2D( (0,0),(0,0), lw='3', color=args.melody_line_color)
+    ax.add_line(melody_graph)
+
+    power_graph = Line2D( (0,0),(0,0), lw=2, color=args.power_line_color )
+    ax.add_line(power_graph)
+    
+    ax.tick_params(axis='x',which='minor',bottom='off')
+    ax.tick_params(axis='y',which='left',bottom='on')
+    
+    # ax.set_yticklabels([0, 50,100,150,200,250,300,350,400,450])
+    ax.set_xticklabels([])
+    
+    
+
+    position_line = Line2D( (0,0),(0,0), lw='1', color=args.line_color)
+    ax.add_line(position_line)
+
+    freq_text = ax.text(0.90, relative_coordinate(args.freq_max - 50 ) , '' , fontsize=18, transform=ax.transAxes, color='black')
+
+    fx = animator(melody, power, melody_graph, power_graph, position_line, freq_text, circle)
+
+    args.frames = len(melody)/args.speed
+    
+    
+    ani = animation.FuncAnimation(fig, fx ,frames= args.frames, interval=args.interval)
+    filename = '{}.mp4'.format(args.audio)
+    plt.tight_layout()
+    
+    if args.action == 'view':
+        plt.show()
+    else:
+        import matplotlib
+        matplotlib.rcParams['savefig.bbox'] == 'tight'
+        ani.save(filename, dpi=args.dpi, codec=args.codec,savefig_kwargs={'facecolor':'black'})
+
+        # writer = animation.FFMpegFileWriter(fps=29)
+        # ani.save(filename, writer=writer)
+
+def animator(melody, power, melody_graph, power_graph, position_line, freq_text, circle):    
+    import librosa
+    import numpy as np
+    power = abs(power)
+    def wrapped(frame):
+        
+        if frame%10 == 0:
+            print frame, ':',  args.frames
+        
+        frame = int(frame * args.speed)        
+        width = int(args.x_max * args.speed)
+        
+        if frame % args.x_max == 0:            
+            # Melody
+            Ys = melody[frame:frame + width]
+            Xs = np.arange(len(Ys))
+            melody_graph.set_data(Xs, Ys)
+            
+
+            # # Power in 0.0 - 1.00
+            seconds = (1.00 * args.interval/args.speed * args.x_max)/1000.00
+            samples = seconds * 44100.00
+
+            new_speed = int(samples/args.x_max) ## Factor
+            # reverse speed
+            start = (frame ) * (1.00* samples / args.x_max)
+            start = int(start)
+            width = int(args.x_max * new_speed)
+            Ys = power[start:start + width]
+            
+            if len(Ys) < width:
+                padding = width - len(Ys)
+                Ys = np.concatenate((Ys, np.zeros(padding)))
+
+            Ys = Ys.reshape(-1, int(new_speed) ).mean(axis=1)            
+            
+            # Reducing sample, primitive smoothing
+            Ys = Ys.reshape(-1, 2).mean(axis=1)            
+            Ys = np.repeat(Ys, 2)
+
+            Ys = Ys * (args.freq_max-args.freq_min) + args.freq_min            
+            Xs = np.arange(len(Ys))            
+            power_graph.set_data(Xs,Ys)
+            
+        
+        freq = melody[frame]        
+        if freq >= 1.00:
+            # note = librosa.hz_to_note(freq - self.tonic_adjustment, octave = False)[0]            
+            # note = NOTES.get(note, note)
+            note = ''
+            text = '{} {:0.2f} Hz'.format(note, freq)
+            freq_text.set_text(text)
+        # freq_text.set_text('{}'.format(frame))
+
+        x = frame % args.x_max
+        if args.show_line:
+            position_line.set_data(( x , x ),(args.freq_min, args.freq_max))
+        circle.center = (x,freq)
+        # circle.set_axes((x, freq))
+
+        return melody_graph, power_graph, position_line, freq_text,circle,
+    return wrapped
+
+
+def prepare_canvas(ax):
+    # Adjust tonic here.    
+    for x in range(12 * 3):
+        fn = freq(x, f0=args.tonic)
+        name = '{}'.format(NOTES[args.notation][x%12])
+        # name = '{} {} '.format(SARGAM[x%12], fn)
+        add_grid(ax, name , fn )
+
+def add_grid(ax, name, fn):
+    from matplotlib.lines import Line2D
+    if fn > args.freq_max or fn < args.freq_min:
+        return
+    y = relative_coordinate(fn + 1)
+    
+
+    ax.add_line(Line2D((0,args.x_max), (fn,fn), color=NOTE_COLOR.get(name, 'red') , alpha = 0.1, lw=15 + 10.00*y ))
+    ax.add_line(Line2D((0,args.x_max), (fn,fn), color=NOTE_COLOR.get(name, 'red') , alpha = 0.7, lw = 0.5))
+    ax.text(0.005, y , name , fontsize=18, transform=ax.transAxes, color=NOTE_COLOR.get(name, 'red'))
+
+def freq(pos, f0=261.625565301):
+    A = 2.0 ** (1.0/12.0)    
+    fn = f0 * (A ** pos)
+    return fn
+
+NOTE_COLOR = {
+    'SA': '#FF7F50',
+    're': '#9ACD32',
+    'RE': '#008000',
+    'ga': '#5F9EA0',
+    'GA': '#008080',
+    'MA': '#FF00FF',
+    'ma': '#800080',
+    'PA': '#FF1493',
+    'dha': '#A52A2A',
+    'DHA': '#800000',
+    'ni': '#00BFFF',
+    'NI': '#000080',
+
+    'C': '#FF7F50',
+    'C#': '#9ACD32',
+    'D': '#008000',
+    'D#': '#5F9EA0',
+    'E': '#008080',
+    'F': '#FF00FF',
+    'F#': '#800080',
+    'G': '#FF1493',
+    'G#': '#A52A2A',
+    'A': '#800000',
+    'A#': '#00BFFF',
+    'B': '#000080',
+
+}
+
+
+def relative_coordinate(m):    
+    return (m - args.freq_min) * (1.0/(args.freq_max - args.freq_min))
+
+NOTES = {
+    'en': ['C',  'C#',  'D',  'D#',  'E',  'F','F#',  'G',  'G#',  'A',  'A#',  'B'],
+    'in': ['SA', 're', 'RE', 'ga', 'GA', 'MA','ma', 'PA', 'dha', 'DHA', 'ni', 'NI']
+}
+
+def load_data():
+    power_file = args.audio + '.asdata'
+    audio_data = None
+    if not os.path.exists(power_file):
+        #load pickle save
+        import librosa
+        audio_file = args.audio
+        audio_data, sr = librosa.load(audio_file, sr=44100, mono=True)
+        # 3983756
+        pickle.dump(audio_data, open(power_file, 'w'))
+    else:
+        audio_data = pickle.load(open(power_file))
+
+    melody_file = args.audio + '.melody'
+    melody = None
+    if not os.path.exists(melody_file):
+        import vamp
+
+        config = {"minfqr": 0.0, "maxfqr": 1200.0, "voicing": args.mel_voicing, "minpeaksalience": 0.0}
+        data = vamp.collect(audio_data, 44100 , "mtg-melodia:melodia", parameters=config)
+        hop, melody = data['vector']
+        pickle.dump(melody, open(melody_file, 'w'))
+    else:
+        melody = pickle.load(open(melody_file))
+    
+    return audio_data, melody
+
+
+
+main()

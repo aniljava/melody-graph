@@ -23,8 +23,12 @@ def process_args():
     parser = argparse.ArgumentParser(description='', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('audio', type=str  ,  help='Input audio [required]')
  
-    parser.add_argument('--tonic', type=float, default=130.81  ,  help='Change the base frequency of C, for SA')   
     parser.add_argument('--action', type=str, default='test'  ,  help='test, save, showall')
+    
+    parser.add_argument('--tonic', type=float, default=130.81  ,  help='Change the base frequency of C, for SA')   
+    parser.add_argument('--down_octaves', type=int, default=-1  ,  help='Total octaves up of ref C')   
+    parser.add_argument('--up_octaves', type=int, default=3  ,  help='Total octaves down of ref C')   
+    parser.add_argument('--majors_only', type=int, default=-1  ,  help='Total octaves down of ref C')   
     
     parser.add_argument('--freq_min', type=int, default=200  ,  help='Min Freq Hz')
     parser.add_argument('--freq_max', type=int, default=600  ,  help='Max Freq Hz')
@@ -49,13 +53,14 @@ def process_args():
     # Design related
     parser.add_argument('--dot_radius', type=float, default=6.0  ,  help='Radius of center dot')
     parser.add_argument('--main_bg', type=str, default='#FFFFF0'  ,  help='Radius of center dot')
-    parser.add_argument('--melody_line_color', type=str, default='#2F4F4F'  ,  help='Radius of center dot')
+    parser.add_argument('--melody_line_color', type=str, default='#A32843'  ,  help='Radius of center dot')
     parser.add_argument('--melody_dot_color', type=str, default='#8B0000'  ,  help='Radius of center dot')
     parser.add_argument('--power_line_color', type=str, default='#000000'  ,  help='Radius of center dot')
     parser.add_argument('--line_color', type=str, default='#000000'  ,  help='Radius of center dot')
     parser.add_argument('--show_line', type=bool, default=True  ,  help='Radius of center dot')
     
     parser.add_argument('--tonic_adjust', type=float, default=0.00  ,  help='Radius of center dot')
+    parser.add_argument('--power_magnification', type=float, default=1.00  ,  help='Radius of center dot')
     args = parser.parse_args()
 
     args.tonic = args.tonic + args.tonic_adjust
@@ -95,11 +100,11 @@ def process(power,melody):
     debug_graph = Line2D( (0,0),(0,0), lw='2', color='red')
     ax.add_line(debug_graph)
 
-    melody_graph = Line2D( (0,0),(0,0), lw='3', color=args.melody_line_color)
+    melody_graph = Line2D( (0,0),(0,0), lw='2', color=args.melody_line_color)
     ax.add_line(melody_graph)
 
 
-    power_graph = Line2D( (0,0),(0,0), lw=2, color=args.power_line_color )
+    power_graph = Line2D( (0,0),(0,0), lw=1, color=args.power_line_color )
     ax.add_line(power_graph)
     
     ax.tick_params(axis='x',which='minor',bottom='off')
@@ -152,7 +157,11 @@ def animator(melody, power, melody_graph, power_graph, position_line, freq_text,
             # Melody
             Ys = melody[frame:frame + width]
             Xs = np.arange(len(Ys))
-            Ys = savitzky_golay(Ys, 11, 4, max_variation=100.00)
+            # Ys[Ys==0.00] = np.nan
+            # Ys = savitzky_golay(Ys, 11, 4)
+            # Ys = savitzky_golay(Ys, 11, 4, max_variation=100.00)
+            Ys[Ys==0.00] = np.nan
+            Ys = savitzky_golay(Ys, 11, 4)
             melody_graph.set_data(Xs, Ys)
             
             # Ys = Ys + 50 ;
@@ -178,8 +187,9 @@ def animator(melody, power, melody_graph, power_graph, position_line, freq_text,
             # Reducing sample, primitive smoothing
             # Ys = Ys.reshape(-1, 2).mean(axis=1)            
             # Ys = np.repeat(Ys, 2)
-            Ys = 10.00 * Ys * (args.freq_max-args.freq_min) + args.freq_min            
-            Ys = savitzky_golay(Ys, 51, 3)
+
+            Ys = args.power_magnification * Ys * (args.freq_max-args.freq_min) + args.freq_min            
+            Ys = savitzky_golay(Ys, 21, 5)
 
             Xs = np.arange(len(Ys))            
             power_graph.set_data(Xs,Ys)
@@ -192,6 +202,8 @@ def animator(melody, power, melody_graph, power_graph, position_line, freq_text,
             note = ''
             text = '{} {:0.2f} Hz'.format(note, freq)
             freq_text.set_text(text)
+        else:
+            freq_text.set_text('')
         # freq_text.set_text('{}'.format(frame))
 
         x = frame % args.x_max
@@ -258,15 +270,12 @@ def savitzky_golay(y, window_size, order, deriv=0, rate=1, max_variation=0.00):
 
 
 def prepare_canvas(ax):
-    # Adjust tonic here.    
-    up = 3
-    down = -1    
-    majors_only = True
-    for octave in range(down , up, 1):
+    # Adjust tonic here.        
+    for octave in range(args.down_octaves ,args.up_octaves, 1):
         for r in range(12):
             x = octave * 12 + r
             fn = freq(x, f0=args.tonic)
-            if majors_only and r in [1,3,6,8,10]:
+            if args.majors_only and r in [1,3,6,8,10]:
                 continue
             name = '{}'.format(NOTES[args.notation][x%12])
             # name = '{} {} '.format(SARGAM[x%12], fn)
@@ -279,7 +288,30 @@ def add_grid(ax, name, fn):
     y = relative_coordinate(fn + 1)
     
 
-    ax.add_line(Line2D((0,args.x_max), (fn,fn), color=NOTE_COLOR.get(name, 'red') , alpha = 0.1, lw=15 + 10.00*y ))
+    d = 1
+    if args.majors_only:
+        d = 1
+    ufn = freq(1*d, fn)
+    dfn = freq(-1*d, fn)
+
+    height = (ufn - fn) + (fn - dfn) 
+    middle = height /2.00
+    bg_y = dfn + middle
+
+    
+
+    from matplotlib.patches import Rectangle
+    
+    # ax.add_patch(Rectangle((0, fn-(fn-dfn)/2.00), args.x_max, height , facecolor=NOTE_COLOR.get(name, 'red')))
+    # ax.add_patch(Rectangle((0, fn-()/2.00), args.x_max, height ,linewidth=0,  facecolor=args.main_bg, alpha=1.0))
+    ax.add_patch(Rectangle((0, fn - (fn-dfn)/2.00), args.x_max, args.freq_max  ,linewidth=0,  zorder= 0 * fn, facecolor=args.main_bg, alpha=1))
+    ax.add_patch(Rectangle((0, fn - (fn-dfn)/2.00), args.x_max, args.freq_max  ,linewidth=0,  zorder= 0 * fn, facecolor=NOTE_COLOR.get(name, 'red'), alpha=0.1))
+
+    # ax.add_line(Line2D((0,args.x_max), (bg_y,bg_y), color=args.main_bg , alpha = 1, lw=height , zorder=0))
+    # ax.add_line(Line2D((0,args.x_max), (bg_y,bg_y), color=NOTE_COLOR.get(name, 'red') , alpha = 0.1, lw=height , zorder=0))
+
+
+
     ax.add_line(Line2D((0,args.x_max), (fn,fn), color=NOTE_COLOR.get(name, 'red') , alpha = 0.7, lw = 0.5))
     ax.text(0.005, y , name , fontsize=18, transform=ax.transAxes, color=NOTE_COLOR.get(name, 'red'))
 
@@ -295,8 +327,8 @@ NOTE_COLOR = {
     'ga': '#5F9EA0',
     'GA': '#008080',
     'MA': '#FF00FF',
-    'ma': '#800080',
-    'PA': '#FF1493',
+    'ma': '#FF1493',
+    'PA': '#800080',
     'dha': '#A52A2A',
     'DHA': '#800000',
     'ni': '#00BFFF',

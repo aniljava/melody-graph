@@ -1,0 +1,1012 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import cairo
+import argparse
+import pickle
+import numpy as np
+import math
+from scipy import signal
+import subprocess
+import Queue
+import threading
+
+params = None
+data = {}
+
+def main():
+    process_args()
+    load_audio_data()
+    load_melody()
+    process()
+
+
+
+    # power, melody = load_data()
+    
+    # # ffmpeg = threading.Thread(target=encoder)
+    # # ffmpeg.start()
+    # process(power, melody)
+    # # ffmpeg.join()
+
+
+def process():
+    melody = data['melody']
+    melody[melody<=0.00] = 0.00
+    audio_data = np.array(data['audio'])
+    
+    total_pages = data['audio_length'] / params.page_rate
+    total_pages = math.ceil(total_pages*100)/100
+
+    total_frames = (data['audio_length'] / 1000.00 ) * 30.00
+    samples_per_page = len(melody)/total_pages
+
+    graph_width = params.c_w - 100.00
+    total_data_points =int( graph_width * total_pages)
+
+    while len(melody) < total_data_points :
+        melody = np.repeat(melody,2)
+    melody = congrid(melody, (total_data_points,))
+
+    patched_melody = data['patched_melody']
+    while len(patched_melody) < total_data_points :
+        patched_melody = np.repeat(patched_melody,2)
+    patched_melody = congrid(patched_melody, (total_data_points,))
+
+    while len(audio_data)<total_data_points :
+        power = np.repeat(audio_data,2)
+    power = congrid(audio_data, (total_data_points,))
+    
+
+    ffmpeg = init_encoder()
+    preview_written = False
+    
+
+    for page in range(int(total_pages)):
+        start = int(graph_width * page)
+        page_power = power[start : start + int(graph_width)] 
+        page_melody = melody[start : start + int(graph_width)]
+        page_patched_melody = patched_melody[start : start + int(graph_width)]
+
+        surface, ctx = blank_canvas()
+        draw_background(ctx)
+        draw_page(page, surface, ctx, page_power, page_melody, page_patched_melody)
+        buffer = surface.get_data()
+
+        frames_per_page = total_frames/total_pages
+        for frame in range(int(frames_per_page)):
+            buffer_data = bytearray(buffer)
+            surface = cairo.ImageSurface.create_for_data(buffer_data, cairo.FORMAT_ARGB32, int(params.c_w), int(params.c_h))
+            ctx = cairo.Context (surface)
+            ctx.set_matrix(cairo.Matrix(1, 0, 0, -1, 0, params.c_h))
+            
+            index = page * frames_per_page + (1.00 * frame )
+            
+            i = (graph_width/frames_per_page) * index
+            i = int(i%graph_width)
+            
+            draw_line(surface, ctx, i , page_patched_melody[i], time_index=index)
+            
+            
+            if not preview_written:
+                preview_written = True
+                filename = '{}-preview.png'.format(params.audio)            
+                print 'PREVIEW WRITTEN' , filename
+                surface.write_to_png(filename)
+                if params.only_preview :
+                    return
+            
+            ffmpeg.stdin.write(surface.get_data())
+
+        ffmpeg.stdin.close()
+        ffmpeg.wait()
+
+def load_audio_data():
+    import librosa
+    audio_data, sample_rate = librosa.load(params.audio, sr=44100, mono = True)
+    data['audio'] = audio_data
+    data['sr'] = sample_rate
+
+def load_melody():
+    import vamp
+    config = {"minfqr": 0.0, "maxfqr": 1200.0, "voicing": params.mel_voicing, "minpeaksalience": params.mel_minpeaksalience}
+    vdata = vamp.collect(data['audio'], data['sr'] , "mtg-melodia:melodia", parameters=config)
+    melody = vdata['vector'][1]
+    data['audio_length'] = len(melody) * 2.903309
+    # melody = abs(melody)
+    data['melody'] = melody
+    patch_melody(data['audio'], melody)
+    melody = data['patched_melody']
+
+    patch_melody(data['audio'], melody)    
+    
+    smooth_melody(data['audio'], data['patched_melody'])
+    data['melody_hop'] = vdata['vector'][0]
+    
+
+
+
+
+
+def patch_melody(audio, melody):
+    patched_melody = [abs(m) for m in melody]  ## crude copy
+    chain = []
+    start = 0
+    started = False    
+    
+    for i, point in enumerate(melody):
+        print point
+        if point <= 0.00 :
+            if started:
+                continue
+            else:
+                started = True
+                start = i
+        else:
+            if started:
+                started = False
+                chain.append([start,i-1])
+                
+    
+    CHAIN_THRESHOLD = 50
+    chain = [c for c in chain if (c[1] - c[0]) > CHAIN_THRESHOLD ]
+    
+    print len(chain)
+    ratio = len(audio) / len(melody)    
+    for segment in chain:
+        start, end = segment
+        audio_start = int(start * ratio)
+        audio_end = int(end*ratio)
+
+        audio_data = audio[audio_start:audio_end]
+        segment_melody = extract_partial_pitch(audio_data)
+
+        for i, pitch in enumerate(segment_melody):            
+            index = i + start
+            print 'INDEX ', index, pitch
+            patched_melody[start + i] = pitch
+
+    data['patched_melody'] = patched_melody
+
+
+## Apply smoothing function on each segments seperately
+def smooth_melody(audio, melody):
+    clusters = []
+    last_cluster = None
+    last_point = melody[0]
+
+    
+    DISJOINT_THRESHOLD = 50
+    for i, point in enumerate(melody):
+        if point <= 0.00 :
+            if last_cluster is None:
+                continue # Nothing to do
+            else:
+                last_cluster = None # Break
+                last_point = 0.0
+        else:
+            if last_cluster is None or abs(last_point - point ) > DISJOINT_THRESHOLD :
+                # Create new cluster
+                last_cluster = [i,i]                
+                clusters.append(last_cluster)
+            else:
+                last_cluster[1] = i
+            
+            last_point = point
+    
+    smoothed = [m for m in melody]  ## crude copy
+    for cluster_index in clusters:
+        start, end = cluster_index
+        cluster = smoothed[start:end]
+        if end-start < 11:
+            continue
+        
+        result = savitzky_golay(cluster, 21,3)
+        for x in range(end-start):
+            melody[start + x] = result[x]
+    
+    # data['melody'] = smoothed
+    
+
+        
+def extract_partial_pitch(audio):
+    import vamp
+    config = {"minfqr": 0.0, "maxfqr": 1200.0, "voicing": params.mel_voicing, "minpeaksalience": params.mel_minpeaksalience}
+    vdata = vamp.collect(audio, data['sr'] , "mtg-melodia:melodia", parameters=config)
+    melody = vdata['vector'][1]
+    return melody
+    
+
+
+
+def log(*args):
+    print ' '.join(str(s) for s in args)
+
+def init_encoder():
+    video_file = '{}-graph.mp4'.format(params.audio)
+    command = [ '/usr/bin/ffmpeg',
+        # '-hwaccel', 'cuvid',
+        # '-hwaccel', 'vaapi',
+        '-f', 'rawvideo',
+        '-vcodec','rawvideo',
+        '-s', '{}x{}'.format(int(params.c_w), int(params.c_h)), # size of one frame
+        '-pix_fmt', 'rgb32',
+        '-r', '{}'.format(params.v_frame_rate), # frames per second
+        '-i', '-', # The input comes from a pipe
+        '-an', # Tells FFMPEG not to expect any audio
+        '-bf', '2',# maximum 2 B-frames as per guideline
+        '-flags', '+cgop', # closed GOP as per guideline
+        '-codec:v', params.codec, # output video codec
+        '-pix_fmt', 'yuv420p', #chroma subsampling 4:2:0 as per guideline        
+        '-y', # (optional) overwrite output file if it exists
+        video_file ]
+
+    stderr = None
+    stderr = subprocess.PIPE # To silence
+    print(command)
+    encoder = subprocess.Popen( command, stdin=subprocess.PIPE, stderr=stderr)
+    return encoder
+
+
+
+def draw_page(page, surface, ctx, power, melody, page_patched_melody):
+    width = int(params.c_w - 100.00)
+    ctx.set_line_join (cairo.LINE_JOIN_ROUND);
+    ctx.set_antialias(cairo.ANTIALIAS_SUBPIXEL)    
+    
+    
+    # Draw power
+    set_color(ctx, params.power_line_color, 1.0)
+    ctx.set_line_width(1)
+    
+
+    # power_dbfs = dbfft(power, int(data['sr']))
+    power = np.abs(power)
+    power = np.clip(power,  0.00000001 , max(power))     
+    
+    old_level = max(power)
+    
+    power = savitzky_golay(power, 31, 3)   
+    # power = power * old_level
+    # print max(power), min(power)
+
+
+    # power /= np.max(np.abs(power),axis=0)
+    # power = 1 - power
+    # power /= np.max(np.abs(power),axis=0)
+
+
+    
+    # print power
+    # power /= np.max(np.abs(power),axis=0)    
+
+    
+
+    ctx.move_to(100.5, 0 )
+    for x in range(0,width):        
+        y = abs(power[x])
+        if math.isnan(y):
+            y = 0
+        
+
+        x = x + 100
+        y = (y * 50.00) - 50       
+        
+        
+        ctx.move_to(x  , 0 * params.y_mag )
+        ctx.line_to(x  , 50 * params.y_mag + y * params.y_mag )
+    ctx.stroke()
+
+    
+    if params.beats_verticals:
+        threshold = max(power) * 0.80
+        ctx.move_to(100.5, 0 )
+        for x in range(0,width):        
+            if power[x] < threshold :
+                continue
+            alpha = power[x] * 0.50
+
+            set_color(ctx, '#0000FF', alpha)
+
+            x = x + 100        
+            
+            ctx.move_to(x  , 0 * params.y_mag )
+            ctx.line_to(x  , params.c_h)
+            
+            ctx.stroke()
+
+
+            # ctx.move_to(x  , 25 * params.y_mag )
+            # ctx.line_to(x  , 25 * params.y_mag - y * params.y_mag )
+            
+            # ctx.move_to(x  , 0)
+
+            
+            
+            # ctx.line_to(x  , 100.00 - y * params.y_mag )
+
+        ctx.line_to(width + 100.5 , 0 )
+        ctx.stroke()
+
+
+    # Draw Patched Melody
+    set_color(ctx, params.melody_line_color, 1.0)
+    ctx.set_line_width(2.00)
+    for x in range(1,width-6,6):
+        x1 = x - 2
+        x2 = x 
+        x3 = x + 2
+
+        y1 = page_patched_melody[x1] * params.y_mag
+        y2 = page_patched_melody[x2] * params.y_mag
+        y3 = page_patched_melody[x3] * params.y_mag
+        # print x1,y1
+
+        if y1 <= 0.00 or y2 <= 0.00 or y3 <= 0.00 or abs(y3-y1) > 100.00:
+            ctx.stroke()
+            continue
+        x1 = x1 + 100.5
+        x2 = x2 + 100.5
+        x3 = x3 + 100.5
+
+        ctx.curve_to(x1,y1,x2,y2,x3,y3)
+        # ctx.line_to(x1,y1)
+    ctx.stroke()
+
+
+    # Draw Patched Melody, inverses
+
+    set_color(ctx, params.melody_line_color, 0.5)
+    ctx.set_line_width(1.00)    
+    page_patched_melody = page_patched_melody * -1.00
+    page_patched_melody[page_patched_melody == 440.0] = 0
+    page_patched_melody[page_patched_melody == 880.0] = 0
+
+    for x in range(1,width-6,6):
+        x1 = x - 2
+        x2 = x 
+        x3 = x + 2
+
+        y1 = page_patched_melody[x1] * params.y_mag
+        y2 = page_patched_melody[x2] * params.y_mag
+        y3 = page_patched_melody[x3] * params.y_mag
+        # print x1,y1
+
+        if y1 <= 0.00 or y2 <= 0.00 or y3 <= 0.00 or abs(y3-y1) > 100.00:
+            ctx.stroke()
+            continue
+        x1 = x1 + 100.5
+        x2 = x2 + 100.5
+        x3 = x3 + 100.5
+
+        ctx.curve_to(x1,y1,x2,y2,x3,y3)
+        # ctx.line_to(x1,y1)
+    ctx.stroke()
+
+    set_color(ctx, params.melody_line_color, 1.0)
+
+
+    draw_raw_melody = False
+    if draw_raw_melody :
+        # Draw Melody
+        set_color(ctx, params.melody_line_color, 1.0)
+        ctx.set_line_width(1.00)
+        for x in range(1,width-6,6):
+            x1 = x - 2
+            x2 = x 
+            x3 = x + 2
+
+            y1 = melody[x1] * params.y_mag
+            y2 = melody[x2] * params.y_mag
+            y3 = melody[x3] * params.y_mag
+            # print x1,y1
+
+            if y1 <= 0.00 or y2 <= 0.00 or y3 <= 0.00 or abs(y3-y1) > 100.00:
+                ctx.stroke()
+                continue
+            x1 = x1 + 100.5
+            x2 = x2 + 100.5
+            x3 = x3 + 100.5
+
+            ctx.curve_to(x1,y1,x2,y2,x3,y3)
+            # ctx.line_to(x1,y1)
+
+        ctx.stroke()
+
+
+    # page_patched_melody = abs(page_patched_melody)
+    # ## Write pitch
+    # PITCH_THRESHOLD = 50
+    # pc = pitch_cluster(power, page_patched_melody)
+    # short = False
+    # last_pitch = None
+    # last_end = 0
+    # for p in pc:
+    #     if p[2] - p[1] < PITCH_THRESHOLD :
+    #         short = True
+    #         continue
+    #     if p[0] == None and short:
+    #         continue
+    #     short = False
+    #     old_last = last_pitch
+    #     last_pitch = p[0]
+    #     if last_pitch == '':
+    #         continue        
+    #     ctx.move_to(100 + p[1], 200)        
+        
+    #     if last_pitch != old_last or abs(last_end - p[1]) > 50 : 
+    #         inverted_text(ctx, p[0], params.font_size + 5)
+    #     ctx.line_to(100 + p[2], 200)
+    #     ctx.stroke()
+
+
+def pitch_cluster(audio, melody):    
+    # TODO Use audio for beats later
+
+    chain = []
+    last_note = None
+    start = 0
+    for i, freq in enumerate(melody):
+        note = freq_to_note(freq, params.tonic)
+        if note == last_note:
+            if i == len(melody) -1:
+                chain.append([last_note, start, i-1])
+        else:
+            if last_note != None:
+                chain.append([last_note, start, i-1])
+            start = i
+            last_note = note
+    
+    return chain
+
+
+def freq_to_note(hz, tonic):
+    if hz <= 0.00:
+        return ''
+
+    # freq table
+    if hz >= tonic:
+        change = 1
+    else:
+        change = -1
+
+    
+    position = 0
+    while True:
+        lower = freq(position - 1, tonic)
+        upper = freq(position + 1, tonic)
+        note =  freq(position, tonic)
+        if hz >= (lower + (note-lower)/2) and (hz < upper - (upper-note)/2) :
+            return TRANSLATION[NOTES['in'][position%12]]
+        position += change
+    
+
+
+def draw_line(surface, ctx, frame, melody,time_index=0):
+    
+    ctx.set_line_width(1.00)
+    set_color(ctx, params.melody_line_color, 1.0)
+    x = frame + 100.5
+    y = melody * params.y_mag
+    ctx.move_to(x, 0)
+    ctx.line_to(x, params.c_h)
+    ctx.stroke()
+    
+    if melody > 0.00:
+        set_color(ctx, params.melody_dot_color, 1.0)
+        ctx.move_to(x, y)
+        ctx.arc(x, y, 8, 0, 2 * math.pi)    
+        ctx.fill()
+
+    ctx.set_font_size(params.font_size)
+    ctx.move_to(params.c_w - 100 , params.c_h - 40)
+    inverted_text(ctx, '{:0.2f} Hz'.format(melody))
+
+    if params.show_time:
+        ctx.set_font_size(params.font_size + 5)
+        ctx.move_to(params.c_w - 100 , params.c_h - 140)
+        mins = 0
+        secs = params.start_secs + time_index/params.v_frame_rate
+        mins = int(secs/60)
+        secs = int(secs%60)
+        inverted_text(ctx, '{:02d}:{:02d}'.format(mins, secs), font_size=params.font_size+8)
+
+
+
+## Grids
+def blank_canvas():
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, int(params.c_w), int(params.c_h))
+    ctx = cairo.Context (surface)
+    ctx.set_matrix(cairo.Matrix(1, 0, 0, -1, 0, params.c_h))
+    set_color(ctx, params.main_bg)    
+    ctx.rectangle(0,0,params.c_w, params.c_h)
+    ctx.fill()
+    ctx.select_font_face(params.font_family , cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+    ctx.set_font_size(params.font_size)
+    return surface, ctx
+
+def draw_scale(ctx):
+    ctx.set_source_rgba(0,0,0,1)  
+    ctx.set_font_size(params.font_size/2)
+    ctx.move_to(100.5,0)
+    ctx.line_to(100.5,params.c_h)
+    
+    for y in range(100,int(params.c_h), 100):
+        ctx.move_to(45,y * params.y_mag + 0.5)
+        ctx.line_to(50,y * params.y_mag + 0.5)
+        ctx.move_to(5,y * params.y_mag + 0.5)
+        inverted_text(ctx,'{: 4d} Hz'.format(y))
+
+        ctx.move_to(45,(y+50) * params.y_mag + 0.5)
+        ctx.line_to(50,(y+50) * params.y_mag + 0.5)
+    ctx.stroke()
+
+def draw_background(ctx):
+    notes = NOTES[params.notation]
+    if params.majors_only:
+        # ALL_NOTES = ['SA', 're', 'RE', 'ga', 'GA', 'MA', 'ma', 'PA', 'dha', 'DHA', 'ni', 'NI']
+        notes = [notes[n] for n in [0,2,4,5,7,9,11] ]
+
+    if params.limit_notes != '':
+        notes = params.limit_notes.split(' ')
+        notes = [n.strip() for n in notes]
+
+    # Adjust tonic here.        
+    for octave in range(params.down_octaves ,params.up_octaves, 1):
+        for r in range(12):
+            x = octave * 12 + r
+            fn = freq(x, f0=params.tonic)
+            if params.majors_only and r in [1,3,6,8,10]:
+                continue
+            note = NOTES[params.notation][x%12]
+            if not note in notes:
+                continue
+            gap = 1
+            ufn = freq(1*gap, fn)
+            dfn = freq(-1*gap, fn)
+            add_grid(ctx, note , fn , ufn, dfn)
+    draw_scale(ctx)
+
+
+
+
+# Draws Pitch lines
+# 
+def add_grid( ctx, name, fn, ufn, dfn):
+    
+    y = fn - (fn - dfn)/2.00
+    height = (fn - dfn)/2.00 + (ufn - fn)/2.00
+    y = int(y)
+    fn = int(fn)
+    
+    
+    set_color(ctx, params.main_bg) 
+    ctx.rectangle(0 , y*params.y_mag , params.c_w, height*params.y_mag)
+    ctx.fill()
+
+    set_color(ctx, NOTE_COLOR.get(name, 'RE'), alpha=0.1)
+    ctx.rectangle(0,y*params.y_mag,params.c_w, height*params.y_mag)
+    ctx.fill()
+    
+    
+    set_color(ctx, NOTE_COLOR.get(name, 'RE'))
+    ctx.move_to(75,fn*params.y_mag + 0.5)
+    ctx.set_line_width(0.5)
+    ctx.line_to(params.c_w,fn*params.y_mag + 0.5)
+    ctx.stroke()
+
+    if fn*params.y_mag < 50:
+        return
+    ctx.move_to(55,fn*params.y_mag-5)
+    inverted_text(ctx,TRANSLATION.get(name, ''))
+
+
+
+
+
+def inverted_text(ctx, text, font_size=None):    
+    backup = ctx.get_matrix()
+    font_backup = ctx.get_font_matrix()
+    if font_size is not None:
+        ctx.set_font_size(font_size)        
+    ctx.set_matrix(cairo.Matrix(1, 0, 0, 1, 0, 0) )
+    ctx.show_text(text)
+    ctx.set_matrix(backup)
+    ctx.set_font_matrix(font_backup)
+
+## UTILS
+def set_color(ctx, rgb, alpha=1.00):
+    ctx.set_source_rgba(*hex2rgb(rgb, alpha))
+def hex2rgb(hexcode, alpha=1.0):
+    rgb = tuple(map(ord,hexcode[1:].decode('hex')))
+    # return tuple([r/255.00 for r in rgb])
+    return tuple([r/255.00 for r in rgb] + [alpha])
+
+def freq(pos, f0=261.625565301):    
+    A = 2.0 ** (1.0/12.0)    
+    r = f0 * (A ** pos)
+    return r
+
+def load_data():
+    power_file = params.audio + '.asdata'
+    audio_data = None
+    if not os.path.exists(power_file):
+        #load pickle save
+        import librosa
+        audio_file = params.audio
+        print 'LOADING AUDIO', audio_file
+        audio_data, sr = librosa.load(audio_file, sr=44100, mono=True)
+        # 3983756
+        pickle.dump(audio_data, open(power_file, 'w'))
+    else:
+        audio_data = pickle.load(open(power_file))
+
+    melody_file = params.audio + '.melody'
+    melody = None
+    use_live = True
+    if use_live or (not os.path.exists(melody_file)):
+        print 'GENERATING MELODY'
+        import vamp
+        use_aubio = False
+        if use_aubio:
+            print 'AUBI'
+            melody = extract_pitch(params.audio)
+        else:
+            config = {"minfqr": 0.0, "maxfqr": 1200.0, "voicing": params.mel_voicing, "minpeaksalience": params.mel_minpeaksalience}
+
+            vdata = vamp.collect(audio_data, 44100 , "mtg-melodia:melodia", parameters=config)
+            hop, melody = vdata['vector']
+        pickle.dump(melody, open(melody_file, 'w'))
+    else:
+        melody = pickle.load(open(melody_file))
+    
+    # filler = extract_pitch(params.audio)
+    # filler = congrid(filler, (len(melody),))
+    # for i in range(len(melody)):
+    #     x = melody[i]
+    #     if x <= 0:
+    #         melody[i] = filler[i]
+
+    return audio_data, melody
+
+
+def extract_pitch(filename):
+    from aubio import source, pitch
+    downsample = 1
+    win_s = 4096 // downsample # fft size
+    hop_s = 128  // downsample # hop size
+    samplerate = 44100 // downsample
+    tolerance = 0.8
+
+    s = source(filename, samplerate, hop_s)
+
+    pitch_o = pitch("yin", win_s, hop_s, samplerate)    
+    pitch_o.set_unit("Hz")
+    pitch_o.set_tolerance(tolerance)
+
+    total_frames = 0
+    pitches = []
+    while True:
+        samples, read = s()
+        pitch = pitch_o(samples)        
+        pitch = pitch[0]
+        #pitch = int(round(pitch))
+        confidence = pitch_o.get_confidence()
+        #if confidence < 0.8: pitch = 0.
+        # print("%f %f %f" % (total_frames / float(samplerate), pitch, confidence))
+        pitches.append(pitch)
+        # confidences += [confidence]
+        total_frames += read
+        if read < hop_s: break
+    return np.array(pitches)
+
+
+def process_args():
+    global params
+
+    parser = argparse.ArgumentParser(description='', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('audio', type=str  ,  help='Input audio [required]')
+
+
+    parser.add_argument('--tonic', type=float, default=138  ,  help='Frequency of C / SA, from any octave.')
+    parser.add_argument('--down_octaves', type=int, default=-1  ,  help='Limit octave lines down the reference SA used')
+    parser.add_argument('--up_octaves', type=int, default=5  ,  help='Limit octave lines above the reference SA used')
+    parser.add_argument('--limit_notes', type=str, default=''  ,  help='Only draw given Notes; SA re RE ga GA MA ma PA dha DHA ni NI')
+
+    parser.add_argument('--codec', type=str, default='libx264'  ,  help='Video Codec used')
+    parser.add_argument('--v_frame_rate', type=int, default='30'  ,  help='Frame rate used')
+    
+
+    parser.add_argument('--majors_only', type=bool, default=False  ,  help='Only draw whole tones')
+
+
+
+    parser.add_argument('--freq_max', type=float, default=1080.00  ,  help='Max freq to show in graph 0-max Hz')
+
+
+
+
+
+
+    parser.add_argument('--action', type=str, default='test'  ,  help='test, save, showall')
+
+
+
+
+
+    parser.add_argument('--freq_min', type=float, default=0.00  ,  help='Min Freq Hz')
+    parser.add_argument('--x_min', type=int, default=0  ,  help='usually 0, start of x range')
+    parser.add_argument('--x_max', type=int, default=1920  ,  help='length of data shown at a time/speed')
+    parser.add_argument('--y_mag', type=float, default=3.00  ,  help='length of data shown at a time/speed')
+    parser.add_argument('--page_rate', type=float, default=8000.00  ,  help='in milliseconds; audio time per page')
+
+    parser.add_argument('--notation', type=str, default='in'  ,  help='Notation used, possible values are "en" CDEFGAB and "in" SARGAM ')
+
+
+    parser.add_argument('--c_w', type=float, default=3840.00  ,  help='Video Width') # 4K = 3840 × 2160
+    parser.add_argument('--c_h', type=float, default=2160.00  ,  help='Video Height')
+    
+
+    parser.add_argument('--interval', type=int, default=29  ,  help='gap per frame, fps=1000/interval; 29 used as it aligns with data')
+    parser.add_argument('--speed', type=int, default=10  ,  help='Magnification; 10x')
+
+    parser.add_argument('--mel_voicing', type=float, default=0.00  ,  help='Melodia param; delete .melody file if changing')
+    parser.add_argument('--mel_minpeaksalience', type=float, default=0.00  ,  help='Melodia param; delete .melody file if changing')
+
+    parser.add_argument('--dpi', type=float, default=72.1  ,  help='dpi used')
+
+    # Design related
+    parser.add_argument('--dot_radius', type=float, default=6.0  ,  help='Radius of center dot')
+    parser.add_argument('--main_bg', type=str, default='#FFFFF0'  ,  help='Radius of center dot')
+    parser.add_argument('--melody_line_color', type=str, default='#111111'  ,  help='Radius of center dot')
+    parser.add_argument('--patched_melody_line_color', type=str, default='#A72642'  ,  help='Radius of center dot')
+    parser.add_argument('--melody_dot_color', type=str, default='#A32843'  ,  help='Radius of center dot')
+    parser.add_argument('--power_line_color', type=str, default='#8B0000'  ,  help='Radius of center dot')
+    parser.add_argument('--line_color', type=str, default='#00FF00'  ,  help='Radius of center dot')
+    parser.add_argument('--show_line', type=bool, default=True  ,  help='Radius of center dot')
+    parser.add_argument('--font_size', type=float, default=18.00  ,  help='Radius of center dot')
+    parser.add_argument('--font_family', type=str, default='FreeSans'  ,  help='Radius of center dot')
+
+    parser.add_argument('--png_start', type=int, default=0  ,  help='Radius of center dot')
+    parser.add_argument('--start_secs', type=float, default=0.00  ,  help='Segment start time of the clip if not zero')
+    parser.add_argument('--show_time', type=bool, default=False  ,  help='Segment start time of the clip if not zero')
+
+    parser.add_argument('--tonic_adjust', type=float, default=0.00  ,  help='Radius of center dot')
+    parser.add_argument('--power_magnification', type=float, default=1000.00  ,  help='Radius of center dot')
+    
+    parser.add_argument('--only_preview', type=bool, default=False  ,  help='Only write the preview, not video')
+    parser.add_argument('--beats_verticals', type=bool, default=False  ,  help='Only write the preview, not video')
+
+    params = parser.parse_args()
+
+    params.tonic = params.tonic + params.tonic_adjust
+
+    # fix the 
+
+
+import numpy as n
+import scipy.interpolate
+import scipy.ndimage
+
+def congrid(a, newdims, method='linear', centre=False, minusone=False):
+    '''Arbitrary resampling of source array to new dimension sizes.
+    Currently only supports maintaining the same number of dimensions.
+    To use 1-D arrays, first promote them to shape (x,1).
+    
+    Uses the same parameters and creates the same co-ordinate lookup points
+    as IDL''s congrid routine, which apparently originally came from a VAX/VMS
+    routine of the same name.
+
+    method:
+    neighbour - closest value from original data
+    nearest and linear - uses n x 1-D interpolations using
+                         scipy.interpolate.interp1d
+    (see Numerical Recipes for validity of use of n 1-D interpolations)
+    spline - uses ndimage.map_coordinates
+
+    centre:
+    True - interpolation points are at the centres of the bins
+    False - points are at the front edge of the bin
+
+    minusone:
+    For example- inarray.shape = (i,j) & new dimensions = (x,y)
+    False - inarray is resampled by factors of (i/x) * (j/y)
+    True - inarray is resampled by(i-1)/(x-1) * (j-1)/(y-1)
+    This prevents extrapolation one element beyond bounds of input array.
+    '''
+    if not a.dtype in [n.float64, n.float32]:
+        a = n.cast[float](a)
+
+    m1 = n.cast[int](minusone)
+    ofs = n.cast[int](centre) * 0.5
+    old = n.array( a.shape )
+    ndims = len( a.shape )
+    if len( newdims ) != ndims:
+        print "[congrid] dimensions error. " \
+              "This routine currently only support " \
+              "rebinning to the same number of dimensions."
+        return None
+    newdims = n.asarray( newdims, dtype=float )
+    dimlist = []
+
+    if method == 'neighbour':
+        for i in range( ndims ):
+            base = n.indices(newdims)[i]
+            dimlist.append( (old[i] - m1) / (newdims[i] - m1) \
+                            * (base + ofs) - ofs )
+        cd = n.array( dimlist ).round().astype(int)
+        newa = a[list( cd )]
+        return newa
+
+    elif method in ['nearest','linear']:
+        # calculate new dims
+        for i in range( ndims ):
+            base = n.arange( newdims[i] )
+            dimlist.append( (old[i] - m1) / (newdims[i] - m1) \
+                            * (base + ofs) - ofs )
+        # specify old dims
+        olddims = [n.arange(i, dtype = n.float) for i in list( a.shape )]
+
+        # first interpolation - for ndims = any
+        mint = scipy.interpolate.interp1d( olddims[-1], a, kind=method )
+        newa = mint( dimlist[-1] )
+
+        trorder = [ndims - 1] + range( ndims - 1 )
+        for i in range( ndims - 2, -1, -1 ):
+            newa = newa.transpose( trorder )
+
+            mint = scipy.interpolate.interp1d( olddims[i], newa, kind=method )
+            newa = mint( dimlist[i] )
+
+        if ndims > 1:
+            # need one more transpose to return to original dimensions
+            newa = newa.transpose( trorder )
+
+        return newa
+    elif method in ['spline']:
+        oslices = [ slice(0,j) for j in old ]
+        oldcoords = n.ogrid[oslices]
+        nslices = [ slice(0,j) for j in list(newdims) ]
+        newcoords = n.mgrid[nslices]
+
+        newcoords_dims = range(n.rank(newcoords))
+        #make first index last
+        newcoords_dims.append(newcoords_dims.pop(0))
+        newcoords_tr = newcoords.transpose(newcoords_dims)
+        # makes a view that affects newcoords
+
+        newcoords_tr += ofs
+
+        deltas = (n.asarray(old) - m1) / (newdims - m1)
+        newcoords_tr *= deltas
+
+        newcoords_tr -= ofs
+
+        newa = scipy.ndimage.map_coordinates(a, newcoords)
+        return newa
+    else:
+        print "Congrid error: Unrecognized interpolation type.\n", \
+              "Currently only \'neighbour\', \'nearest\',\'linear\',", \
+              "and \'spline\' are supported."
+        return None
+
+def savitzky_golay(y, window_size, order, deriv=0, rate=1, max_variation=0.00):
+
+    import numpy as np
+    from math import factorial
+
+    try:
+        window_size = np.abs(np.int(window_size))
+        order = np.abs(np.int(order))
+    except ValueError, msg:
+        raise ValueError("window_size and order have to be of type int")
+    if window_size % 2 != 1 or window_size < 1:
+        raise TypeError("window_size size must be a positive odd number")
+    if window_size < order + 2:
+        raise TypeError("window_size is too small for the polynomials order")
+    order_range = range(order+1)
+    half_window = (window_size -1) // 2
+    # precompute coefficients
+    b = np.mat([[k**i for i in order_range] for k in range(-half_window, half_window+1)])
+    m = np.linalg.pinv(b).A[deriv] * rate**deriv * factorial(deriv)
+    # pad the signal at the extremes with
+    # values taken from the signal itself
+    firstvals = y[0] - np.abs( y[1:half_window+1][::-1] - y[0] )
+    lastvals = y[-1] + np.abs(y[-half_window-1:-1][::-1] - y[-1])
+    y = np.concatenate((firstvals, y, lastvals))
+    result =  np.convolve( m[::-1], y, mode='valid')
+    return result
+
+
+def dbfft(x, fs, win=None, ref=32768):
+    """
+    Calculate spectrum in dB scale
+    Args:
+        x: input signal
+        fs: sampling frequency
+        win: vector containing window samples (same length as x).
+             If not provided, then rectangular window is used by default.
+        ref: reference value used for dBFS scale. 32768 for int16 and 1 for float
+
+    Returns:
+        freq: frequency vector
+        s_db: spectrum in dB scale
+    """
+
+    N = len(x)  # Length of input sequence
+
+    if win is None:
+        win = np.ones((1, N))
+        print len(x), len(win)
+    
+    # if len(x) != len(win):
+    #         raise ValueError('Signal and window must be of the same length')
+    x = x * win
+
+    # Calculate real FFT and frequency vector
+    sp = np.fft.rfft(x)
+    freq = np.arange((N / 2) + 1) / (float(N) / fs)
+
+    # Scale the magnitude of FFT by window and factor of 2,
+    # because we are using half of FFT spectrum.
+    s_mag = np.abs(sp) * 2 / np.sum(win)
+
+    # Convert to dBFS
+    s_dbfs = 20 * np.log10(s_mag/ref)
+
+    return freq, s_dbfs
+
+
+
+
+NOTES = {
+    'en': ['C',  'C#',  'D',  'D#',  'E',  'F','F#',  'G',  'G#',  'A',  'A#',  'B'],
+    'in': ['SA', 're', 'RE', 'ga', 'GA', 'MA','ma', 'PA', 'dha', 'DHA', 'ni', 'NI']
+}
+NOTE_COLOR = {
+    'SA': '#FF7F50',
+    're': '#9ACD32',
+    'RE': '#008000',
+    'ga': '#5F9EA0',
+    'GA': '#008080',
+    'MA': '#FF00FF',
+    'ma': '#FF1493',
+    'PA': '#800080',
+    'dha': '#A52A2A',
+    'DHA': '#800000',
+    'ni': '#00BFFF',
+    'NI': '#000080',
+
+    'C': '#FF7F50',
+    'C#': '#9ACD32',
+    'D': '#008000',
+    'D#': '#5F9EA0',
+    'E': '#008080',
+    'F': '#FF00FF',
+    'F#': '#800080',
+    'G': '#FF1493',
+    'G#': '#A52A2A',
+    'A': '#800000',
+    'A#': '#00BFFF',
+    'B': '#000080',
+
+}
+
+TRANSLATION = {
+    'SA': u'सा',
+    're': u'रे॒',
+    'RE': u'रे',
+    'ga': u'ग॒',
+    'GA': u'ग',
+    'MA': u'म',
+    'ma': u'म॑',
+    'PA': u'प',
+    'dha': u'ध॒',
+    'DHA': u'ध',
+    'ni': u'िन॒',
+    'NI': u'िन',
+}
+
+main()
